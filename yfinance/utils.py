@@ -22,6 +22,8 @@
 from __future__ import print_function
 
 import datetime as _datetime
+import json
+
 import pytz as _tz
 import requests as _requests
 import re as _re
@@ -158,6 +160,98 @@ def decrypt_cryptojs_stores(data):
 
     return plaintext
 
+
+def decrypt_cryptojs_aes_stores(data):
+    encrypted_stores = data['context']['dispatcher']['stores']
+
+    if "_cs" in data and "_cr" in data:
+        _cs = data["_cs"]
+        _cr = data["_cr"]
+        _cr = b"".join(int.to_bytes(i, length=4, byteorder="big", signed=True) for i in json.loads(_cr)["words"])
+        password = hashlib.pbkdf2_hmac("sha1", _cs.encode("utf8"), _cr, 1, dklen=32).hex()
+    else:
+        # Currently assume one extra key in dict, which is password. Print error if
+        # more extra keys detected.
+        new_keys = [k for k in data.keys() if k not in ["context", "plugins"]]
+        l = len(new_keys)
+        if l == 0:
+            return None
+        elif l == 1 and isinstance(data[new_keys[0]], str):
+            password_key = new_keys[0]
+        else:
+            msg = "Yahoo has again changed data format, yfinance now unsure which key(s) is for decryption:"
+            k = new_keys[0]
+            k_str = k if len(k) < 32 else k[:32-3]+"..."
+            msg += f" '{k_str}'->{type(data[k])}"
+            for i in range(1, len(new_keys)):
+                msg += f" , '{k_str}'->{type(data[k])}"
+            raise Exception(msg)
+        password_key = new_keys[0]
+        password = data[password_key]
+
+    encrypted_stores = b64decode(encrypted_stores)
+    assert encrypted_stores[0:8] == b"Salted__"
+    salt = encrypted_stores[8:16]
+    encrypted_stores = encrypted_stores[16:]
+
+    def EVPKDF(password, salt, keySize=32, ivSize=16, iterations=1, hashAlgorithm="md5") -> tuple:
+        """OpenSSL EVP Key Derivation Function
+        Args:
+            password (Union[str, bytes, bytearray]): Password to generate key from.
+            salt (Union[bytes, bytearray]): Salt to use.
+            keySize (int, optional): Output key length in bytes. Defaults to 32.
+            ivSize (int, optional): Output Initialization Vector (IV) length in bytes. Defaults to 16.
+            iterations (int, optional): Number of iterations to perform. Defaults to 1.
+            hashAlgorithm (str, optional): Hash algorithm to use for the KDF. Defaults to 'md5'.
+        Returns:
+            key, iv: Derived key and Initialization Vector (IV) bytes.
+        Taken from: https://gist.github.com/rafiibrahim8/0cd0f8c46896cafef6486cb1a50a16d3
+        OpenSSL original code: https://github.com/openssl/openssl/blob/master/crypto/evp/evp_key.c#L78
+        """
+
+        assert iterations > 0, "Iterations can not be less than 1."
+
+        if isinstance(password, str):
+            password = password.encode("utf-8")
+
+        final_length = keySize + ivSize
+        key_iv = b""
+        block = None
+
+        while len(key_iv) < final_length:
+            hasher = hashlib.new(hashAlgorithm)
+            if block:
+                hasher.update(block)
+            hasher.update(password)
+            hasher.update(salt)
+            block = hasher.digest()
+            for _ in range(1, iterations):
+                block = hashlib.new(hashAlgorithm, block).digest()
+            key_iv += block
+
+        key, iv = key_iv[:keySize], key_iv[keySize:final_length]
+        return key, iv
+
+    try:
+        key, iv = EVPKDF(password, salt, keySize=32, ivSize=16, iterations=1, hashAlgorithm="md5")
+    except:
+        raise Exception("yfinance failed to decrypt Yahoo data response")
+
+    if usePycryptodome:
+        cipher = AES.new(key, AES.MODE_CBC, iv=iv)
+        plaintext = cipher.decrypt(encrypted_stores)
+        plaintext = unpad(plaintext, 16, style="pkcs7")
+    else:
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+        decryptor = cipher.decryptor()
+        plaintext = decryptor.update(encrypted_stores) + decryptor.finalize()
+        unpadder = padding.PKCS7(128).unpadder()
+        plaintext = unpadder.update(plaintext) + unpadder.finalize()
+        plaintext = plaintext.decode("utf-8")
+
+    decoded_stores = json.loads(plaintext)
+    return decoded_stores
+
 def _EVPKDF(password, salt, keySize=32, ivSize=16, iterations=1, hashAlgorithm="md5") -> tuple:
     """OpenSSL EVP Key Derivation Function
     Args:
@@ -206,14 +300,23 @@ def get_json(url, proxy=None, session=None):
         '(this)')[0].split(';\n}')[0].strip()
     data = _json.loads(json_str)
 
-    if "_cs" in data and "_cr" in data:
-        data_stores = _json.loads(decrypt_cryptojs_stores(data))
-    else:
+    data_stores = decrypt_cryptojs_aes_stores(data)
+    if data_stores is None:
+        # Maybe Yahoo returned old format, not encrypted
         if "context" in data and "dispatcher" in data["context"]:
-            # Keep old code, just in case
             data_stores = data['context']['dispatcher']['stores']
-        else:
-            data_stores = data
+    if data_stores is None:
+        raise Exception(f": Failed to extract data stores from web request")
+
+    #
+    # if "_cs" in data and "_cr" in data:
+    #     data_stores = _json.loads(decrypt_cryptojs_stores(data))
+    # else:
+    #     if "context" in data and "dispatcher" in data["context"]:
+    #         # Keep old code, just in case
+    #         data_stores = data['context']['dispatcher']['stores']
+    #     else:
+    #         data_stores = data
 
     data = data_stores['QuoteSummaryStore']
     # add data about Shares Outstanding for companies' tickers if they are available
